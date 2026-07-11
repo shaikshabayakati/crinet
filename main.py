@@ -43,7 +43,7 @@ GEMINI_WS_URL    = (
     "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
     f"?key={GEMINI_API_KEY}"
 )
-GEMINI_MODEL     = "models/gemini-3.1-flash-live-preview"
+GEMINI_MODEL     = "models/gemini-live-2.5-flash-preview"
 
 logging.basicConfig(
     level=logging.INFO,
