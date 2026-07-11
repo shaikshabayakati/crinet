@@ -72,7 +72,7 @@ async def broadcast_alert(payload: dict):
 
 # ─── Gemini system prompt & tool declaration ──────────────────────────────────
 SYSTEM_PROMPT = """
-You are silently monitoring a live phone call. NEVER speak or generate audio output.
+You are silently monitoring a live phone call. You receive audio but should respond minimally.
 Watch for these scam patterns:
   • OTP / PIN / password requests
   • Gift-card or cryptocurrency payment demands
@@ -83,12 +83,15 @@ Watch for these scam patterns:
 
 The moment you detect ANY of the above, call flag_scam_alert IMMEDIATELY.
 Do not wait for the call to end. Do not ask clarifying questions. Just call the function.
+Keep your spoken response very brief or silent after calling the function.
 """
 
 GEMINI_SETUP_MSG = {
     "setup": {
         "model": GEMINI_MODEL,
-        "responseModalities": ["TEXT"],
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+        },
         "systemInstruction": {
             "parts": [{"text": SYSTEM_PROMPT}]
         },
