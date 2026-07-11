@@ -485,15 +485,12 @@ async def answer_webhook(request: Request):
     dial_url     = f"{PUBLIC_HOST}/dial-result"
     callback_url = f"{PUBLIC_HOST}/dial-callback"
 
-    # Build XML response
     if victim:
-        # Two-number flow: <Dial> bridges scammer ↔ victim.
-        # redirect="false" → Vobiz still POSTs to action URL for logging,
-        # but ignores its XML and continues to the <Stream> element below.
-        # This ensures the scammer's call is always streamed even if dial fails.
-        # callbackUrl fires live events (answer/connected/hangup) — we use it
-        # to start the audio stream via REST API during the bridged call.
-        active_call_uuids[call_uuid] = victim   # stash for /dial-callback
+        # Two-number flow: <Dial redirect="false"> bridges scammer ↔ victim
+        # AND <Stream keepCallAlive="true"> forks audio for Gemini monitoring.
+        # With redirect="false", Vobiz moves to <Stream> immediately after
+        # starting the Dial in the background — both run simultaneously.
+        active_call_uuids[call_uuid] = victim
         xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Dial timeout="30"
@@ -512,8 +509,8 @@ async def answer_webhook(request: Request):
   </Stream>
 </Response>"""
         log.info(
-            "Two-number flow XML: bridging %s → victim %s  (redirect=false, stream fallback)",
-            call_uuid, victim,
+            "Two-number flow XML: Dial+Stream → victim %s  (uuid=%s)",
+            victim, call_uuid,
         )
     else:
         # Single-number flow: keep call alive and stream audio for monitoring
@@ -541,75 +538,48 @@ async def stream_status(request: Request):
     return PlainTextResponse("OK")
 
 
-# ─── Phase 1: Dial action URL (fires AFTER dial ends) ─────────────────────────
+# ─── Phase 1: Dial action URL (fires AFTER dial ends, redirect="false"→skipped) ──
 @app.post("/dial-result")
 async def dial_result(request: Request):
     """
     Vobiz action URL — fires once after <Dial> completes.
-    DialStatus values: completed, busy, failed, cancel, timeout, no-answer.
-    Audio streaming is handled by /dial-callback (callbackUrl) which fires
-    LIVE when the victim answers. This endpoint is for post-dial cleanup/logging.
+    With redirect="false" in the XML, this is just for logging.
+    If the stream somehow wasn't started yet, return <Stream> XML as fallback.
     """
     form = await request.form()
     log.info("Dial result ALL fields: %s", dict(form))
 
     dial_status  = form.get("DialStatus", "")
-    dial_ring    = form.get("DialRingStatus", "")
     a_leg_uuid   = form.get("DialALegUUID", "") or form.get("CallUUID", "")
-    b_leg_uuid   = form.get("DialBLegUUID", "")
-    hangup_cause = form.get("DialHangupCause", "")
 
-    log.info(
-        "DialStatus=%s  DialRingStatus=%s  hangup=%s  a_leg=%s  b_leg=%s",
-        dial_status, dial_ring, hangup_cause, a_leg_uuid, b_leg_uuid,
-    )
+    log.info("DialStatus=%s  a_leg=%s", dial_status, a_leg_uuid)
 
-    # If the dial completed successfully but callbackUrl somehow didn't fire,
-    # fall back to starting the audio stream here (safety net).
-    if a_leg_uuid and dial_status == "completed" and a_leg_uuid not in active_sessions:
-        log.warning("callbackUrl may have been missed — starting stream on a_leg=%s as fallback", a_leg_uuid)
-        ws_url     = f"{PUBLIC_HOST.replace('https://', 'wss://')}/media-stream"
-        status_url = f"{PUBLIC_HOST}/stream-status"
-        stream_url = f"{VOBIZ_API_BASE}/Account/{VOBIZ_AUTH_ID}/Call/{a_leg_uuid}/Stream/"
-        headers = {
-            "X-Auth-ID":    VOBIZ_AUTH_ID,
-            "X-Auth-Token": VOBIZ_AUTH_TOKEN,
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "service_url":         ws_url,
-            "bidirectional":       True,
-            "audio_track":         "inbound",
-            "content_type":        "audio/x-l16;rate=16000",
-            "status_callback_url": status_url,
-        }
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(stream_url, json=payload, headers=headers)
-        log.info("Fallback stream start (REST) %d: %s", resp.status_code, resp.text[:200])
-
-        if resp.status_code in (200, 201, 202):
-            session = GeminiSession()
-            active_sessions[a_leg_uuid] = session
-            asyncio.create_task(session.start())
-            log.info("Gemini session started (fallback) for a_leg=%s", a_leg_uuid)
-
-    # Return valid XML so Vobiz doesn't error on redirect=true
-    return PlainTextResponse(
-        content='<?xml version="1.0" encoding="UTF-8"?>\n<Response></Response>',
-        media_type="application/xml",
-    )
+    # Safety net: if stream wasn't started during the call, start it now
+    ws_url     = f"{PUBLIC_HOST.replace('https://', 'wss://')}/media-stream"
+    status_url = f"{PUBLIC_HOST}/stream-status"
+    stream_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Stream bidirectional="true"
+          audioTrack="inbound"
+          contentType="audio/x-l16;rate=16000"
+          keepCallAlive="true"
+          statusCallbackUrl="{status_url}">
+    {ws_url}
+  </Stream>
+</Response>"""
+    log.info("Returning Stream XML fallback after dial (DialStatus=%s)", dial_status)
+    return PlainTextResponse(content=stream_xml, media_type="application/xml")
 
 
 # ─── Phase 2: Dial callbackUrl handler (fires LIVE during dial) ───────────────
 @app.post("/dial-callback")
 async def dial_callback(request: Request):
     """
-    Vobiz callbackUrl handler — fires live events during the <Dial>:
-      DialAction = answer  → victim picked up
-      DialAction = connected → victim bridged to scammer
-      DialAction = hangup  → victim hung up
-      DialAction = digits  → digit pressed
-    We start the audio stream on the scammer's leg the moment the victim answers.
+    Vobiz callbackUrl — fires live events during <Dial>:
+      DialAction = answer/connected → victim picked up / bridged
+      DialAction = hangup → victim hung up
+    As a BACKUP, we try starting the audio stream via REST API.
+    The primary path is the XML <Stream> in /answer.
     """
     form = await request.form()
     log.info("Dial callbackUrl ALL fields: %s", dict(form))
@@ -623,15 +593,15 @@ async def dial_callback(request: Request):
     b_leg_uuid  = form.get("DialBLegUUID", "")
     log.info("DialAction=%s  a_leg=%s  b_leg=%s", dial_action, a_leg_uuid, b_leg_uuid)
 
-    # Start audio stream on the scammer's call leg when victim answers/bridges
-    if a_leg_uuid and dial_action in ("answer", "connected"):
-        if a_leg_uuid in active_sessions:
-            log.info("Session already active for a_leg=%s, skipping", a_leg_uuid)
+    # BACKUP: try REST stream start when victim answers/bridges
+    # The XML <Stream> in /answer is the primary path; this is insurance.
+    if dial_action in ("answer", "connected") and a_leg_uuid:
+        if a_leg_uuid in active_sessions or b_leg_uuid in active_sessions:
+            log.info("Session already active, skipping REST start")
             return PlainTextResponse("OK")
 
         ws_url     = f"{PUBLIC_HOST.replace('https://', 'wss://')}/media-stream"
         status_url = f"{PUBLIC_HOST}/stream-status"
-        stream_url = f"{VOBIZ_API_BASE}/Account/{VOBIZ_AUTH_ID}/Call/{a_leg_uuid}/Stream/"
         headers = {
             "X-Auth-ID":    VOBIZ_AUTH_ID,
             "X-Auth-Token": VOBIZ_AUTH_TOKEN,
@@ -644,18 +614,22 @@ async def dial_callback(request: Request):
             "content_type":        "audio/x-l16;rate=16000",
             "status_callback_url": status_url,
         }
-        log.info("Victim %s — starting stream on scammer A-leg %s …", dial_action, a_leg_uuid)
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(stream_url, json=payload, headers=headers)
-        log.info("Stream start (REST) %d: %s", resp.status_code, resp.text[:200])
 
-        if resp.status_code in (200, 201, 202):
-            session = GeminiSession()
-            active_sessions[a_leg_uuid] = session
-            asyncio.create_task(session.start())
-            log.info("Gemini session started for a_leg=%s", a_leg_uuid)
-        else:
-            log.error("⛔ Stream REST start failed: %s %s", resp.status_code, resp.text)
+        # Try A-leg UUID with retries (404 = call not yet live, retry after delay)
+        stream_url = f"{VOBIZ_API_BASE}/Account/{VOBIZ_AUTH_ID}/Call/{a_leg_uuid}/Stream/"
+        async with httpx.AsyncClient(timeout=15) as client:
+            for attempt in range(1, 4):
+                log.info("REST stream start attempt %d/3 on a_leg=%s …", attempt, a_leg_uuid)
+                resp = await client.post(stream_url, json=payload, headers=headers)
+                log.info("  → %d %s", resp.status_code, resp.text[:200])
+                if resp.status_code in (200, 201, 202):
+                    log.info("✅ REST stream started successfully on a_leg=%s", a_leg_uuid)
+                    break
+                if resp.status_code == 404:
+                    await asyncio.sleep(attempt)
+                else:
+                    log.warning("Non-404 REST stream error: %s", resp.text[:200])
+                    break
 
     return PlainTextResponse("OK")
 
@@ -664,7 +638,7 @@ async def dial_callback(request: Request):
 @app.websocket("/media-stream")
 async def media_stream(ws: WebSocket):
     await ws.accept()
-    log.info("Vobiz media-stream connected")
+    log.info("══════ Vobiz media-stream WebSocket CONNECTED ══════")
 
     call_uuid: Optional[str] = None
     session:   Optional[GeminiSession] = None
@@ -684,13 +658,15 @@ async def media_stream(ws: WebSocket):
                     call_uuid, stream_id,
                     start_data.get("mediaFormat"),
                 )
-                # Reuse existing session (REST API may have created it in /dial-callback)
+                # Always create a new session for this stream
                 if call_uuid in active_sessions:
                     session = active_sessions[call_uuid]
+                    log.info("Reusing existing Gemini session for callId=%s", call_uuid)
                 else:
                     session = GeminiSession()
                     active_sessions[call_uuid] = session
                     asyncio.create_task(session.start())
+                    log.info("New Gemini session created for callId=%s", call_uuid)
 
             # ── media ────────────────────────────────────────────────────────
             elif event == "media" and session:
@@ -699,23 +675,20 @@ async def media_stream(ws: WebSocket):
                 if not payload:
                     continue
 
-                # 1. base64-decode → big-endian PCM16 bytes
+                # base64-decode → big-endian PCM16 → swap to little-endian
                 be_bytes = base64.b64decode(payload)
-
-                # 2. swap byte order: big-endian → little-endian
-                #    Vobiz L16 is network (big-endian); Gemini wants little-endian
                 n_samples = len(be_bytes) // 2
-                le_bytes  = struct.pack(
-                    f"<{n_samples}h",
-                    *struct.unpack(f">{n_samples}h", be_bytes[:n_samples * 2])
-                )
-
-                await session.push_audio(le_bytes)
+                if n_samples > 0:
+                    le_bytes = struct.pack(
+                        f"<{n_samples}h",
+                        *struct.unpack(f">{n_samples}h", be_bytes[:n_samples * 2])
+                    )
+                    await session.push_audio(le_bytes)
 
             # ── anything else ────────────────────────────────────────────────
             else:
                 if event not in ("media",):
-                    log.debug("WS event: %s", event)
+                    log.info("WS event: %s", event)
 
     except WebSocketDisconnect:
         log.info("Vobiz WS disconnected (callId=%s)", call_uuid)
