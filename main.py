@@ -88,10 +88,10 @@ Do not wait for the call to end. Do not ask clarifying questions. Just call the 
 GEMINI_SETUP_MSG = {
     "setup": {
         "model": GEMINI_MODEL,
-        "generation_config": {
-            "response_modalities": ["TEXT"],
+        "generationConfig": {
+            "responseModalities": ["TEXT"],
         },
-        "system_instruction": {
+        "systemInstruction": {
             "parts": [{"text": SYSTEM_PROMPT}]
         },
         "tools": [{
@@ -136,6 +136,8 @@ class GeminiSession:
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._audio_queue: asyncio.Queue[bytes] = asyncio.Queue()
         self._running = False
+        self._recv_task: Optional[asyncio.Task] = None
+        self._send_task: Optional[asyncio.Task] = None
 
     async def start(self):
         log.info("Connecting to Gemini Live …")
@@ -146,16 +148,25 @@ class GeminiSession:
                 ping_timeout=10,
             )
             # 1 — send setup
-            await self._ws.send(json.dumps(GEMINI_SETUP_MSG))
-            # wait for setupComplete
-            resp = await self._ws.recv()
-            log.info("Gemini setup response: %s", resp[:200])
+            setup_json = json.dumps(GEMINI_SETUP_MSG)
+            log.info("Sending Gemini setup: %s", setup_json[:300])
+            await self._ws.send(setup_json)
+
+            # 2 — wait for setupComplete
+            raw = await self._ws.recv()
+            resp = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode())
+            log.info("Gemini setup response: %s", json.dumps(resp)[:500])
+
+            if "setupComplete" not in resp:
+                log.error("Gemini did NOT return setupComplete! Full response: %s", resp)
+                raise RuntimeError(f"Gemini setup failed: {resp}")
+
             self._running = True
-            asyncio.create_task(self._recv_loop())
-            asyncio.create_task(self._send_loop())
-            log.info("Gemini Live session ready.")
+            self._recv_task = asyncio.create_task(self._recv_loop())
+            self._send_task = asyncio.create_task(self._send_loop())
+            log.info("Gemini Live session ready — streaming audio now.")
         except Exception as exc:
-            log.error("Gemini connection failed: %s", exc)
+            log.error("Gemini connection failed: %s", exc, exc_info=True)
             raise
 
     async def push_audio(self, pcm_le_bytes: bytes):
@@ -164,10 +175,16 @@ class GeminiSession:
 
     async def stop(self):
         self._running = False
+        if self._recv_task:
+            self._recv_task.cancel()
+        if self._send_task:
+            self._send_task.cancel()
         if self._ws:
-            await self._ws.close()
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
 
-    # ── internal loops ────────────────────────────────────────────────────────
     async def _send_loop(self):
         while self._running:
             try:
@@ -195,42 +212,97 @@ class GeminiSession:
                 await self._handle_server_msg(raw)
             except asyncio.TimeoutError:
                 continue
-            except websockets.ConnectionClosed:
-                log.info("Gemini WS closed.")
+            except websockets.ConnectionClosed as exc:
+                log.warning("Gemini WS closed: %s", exc)
                 break
             except Exception as exc:
-                log.error("Gemini recv error: %s", exc)
+                log.error("Gemini recv error: %s", exc, exc_info=True)
                 break
 
     async def _handle_server_msg(self, raw: str | bytes):
         try:
-            msg = json.loads(raw)
+            msg = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode())
         except Exception:
+            log.warning("Gemini sent non-JSON: %s", str(raw)[:200])
             return
 
-        # Detect function calls (scam alerts)
-        candidates = (
-            msg.get("serverContent", {})
-               .get("modelTurn", {})
-               .get("parts", [])
-        )
-        for part in candidates:
-            fc = part.get("functionCall")
-            if fc and fc.get("name") == "flag_scam_alert":
-                args = fc.get("args", {})
-                log.warning("🚨 SCAM DETECTED: %s", args)
-                await broadcast_alert({
-                    "type": "scam_alert",
-                    "category":   args.get("category", "other"),
-                    "confidence": args.get("confidence", 1.0),
-                    "reason":     args.get("reason", ""),
-                })
-                return
+        # ── 1. Tool call (top-level field) ──────────────────────────────────
+        #    Gemini Live sends {"toolCall": {"functionCalls": [...]}} at the
+        #    top level — NOT nested inside serverContent.modelTurn.parts.
+        tool_call = msg.get("toolCall")
+        if tool_call:
+            for fc in tool_call.get("functionCalls", []):
+                if fc.get("name") == "flag_scam_alert":
+                    args = fc.get("args", {})
+                    fc_id = fc.get("id", "")
+                    log.warning(
+                        "SCAM DETECTED: category=%s confidence=%s reason=%s  (id=%s)",
+                        args.get("category"), args.get("confidence"),
+                        args.get("reason"), fc_id,
+                    )
+                    await broadcast_alert({
+                        "type":       "scam_alert",
+                        "category":   args.get("category", "other"),
+                        "confidence": args.get("confidence", 1.0),
+                        "reason":     args.get("reason", ""),
+                    })
+                    await self._send_tool_response(fc_id, fc.get("name"), {"status": "alerted"})
+                else:
+                    log.info("Unknown tool call: %s args=%s", fc.get("name"), fc.get("args"))
+                    await self._send_tool_response(fc.get("id", ""), fc.get("name", ""), {"status": "ok"})
+            return
 
-        # Log any text responses (shouldn't be many, model is listen-only)
-        text_parts = [p.get("text", "") for p in candidates if "text" in p]
-        if text_parts:
-            log.info("Gemini text: %s", " ".join(text_parts))
+        # ── 2. Server content (text / audio / model turn) ───────────────────
+        server_content = msg.get("serverContent", {})
+        if server_content:
+            model_turn = server_content.get("modelTurn", {})
+            parts = model_turn.get("parts", [])
+
+            # Alternate format: function calls INSIDE modelTurn parts
+            for part in parts:
+                fc = part.get("functionCall")
+                if fc and fc.get("name") == "flag_scam_alert":
+                    args = fc.get("args", {})
+                    fc_id = fc.get("id", "")
+                    log.warning("SCAM DETECTED (in modelTurn): %s", args)
+                    await broadcast_alert({
+                        "type":       "scam_alert",
+                        "category":   args.get("category", "other"),
+                        "confidence": args.get("confidence", 1.0),
+                        "reason":     args.get("reason", ""),
+                    })
+                    await self._send_tool_response(fc_id, fc.get("name"), {"status": "alerted"})
+
+            text_parts = [p.get("text", "") for p in parts if "text" in p]
+            if text_parts:
+                log.info("Gemini text: %s", " ".join(text_parts))
+
+            if server_content.get("turnComplete"):
+                log.debug("Gemini turn complete.")
+
+        if "setupComplete" in msg:
+            log.info("Gemini setupComplete (late).")
+
+        if not tool_call and not server_content and "setupComplete" not in msg:
+            log.debug("Gemini unclassified msg: %s", json.dumps(msg)[:300])
+
+    async def _send_tool_response(self, fc_id: str, fc_name: str, result: dict):
+        """Send a tool response back to Gemini — required after function calls."""
+        tool_response = {
+            "toolResponse": {
+                "functionResponses": [{
+                    "id":       fc_id,
+                    "name":     fc_name,
+                    "response": result,
+                }]
+            }
+        }
+        try:
+            resp_json = json.dumps(tool_response)
+            log.info("Sending tool response: %s", resp_json[:300])
+            await self._ws.send(resp_json)
+        except Exception as exc:
+            log.error("Failed to send tool response: %s", exc)
 
 
 # One active session per CallUUID
