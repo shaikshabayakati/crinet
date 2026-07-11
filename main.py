@@ -96,7 +96,7 @@ GEMINI_SETUP_MSG = {
             "parts": [{"text": SYSTEM_PROMPT}]
         },
         "tools": [{
-            "function_declarations": [{
+            "functionDeclarations": [{
                 "name": "flag_scam_alert",
                 "description": "Call the instant a scam pattern appears.",
                 "parameters": {
@@ -115,7 +115,7 @@ GEMINI_SETUP_MSG = {
                         },
                         "confidence": {
                             "type": "number",
-                            "description": "0.0–1.0 confidence score",
+                            "description": "0.0-1.0 confidence score",
                         },
                         "reason": {
                             "type": "string",
@@ -187,24 +187,29 @@ class GeminiSession:
                 pass
 
     async def _send_loop(self):
+        chunks_sent = 0
         while self._running:
             try:
                 chunk = await asyncio.wait_for(self._audio_queue.get(), timeout=1.0)
                 audio_b64 = base64.b64encode(chunk).decode()
                 msg = {
-                    "realtime_input": {
-                        "media_chunks": [{
-                            "mime_type": "audio/pcm;rate=16000",
+                    "realtimeInput": {
+                        "audio": {
                             "data": audio_b64,
-                        }]
+                            "mimeType": "audio/pcm;rate=16000",
+                        }
                     }
                 }
                 await self._ws.send(json.dumps(msg))
+                chunks_sent += 1
+                if chunks_sent % 50 == 0:
+                    log.info("📤 Sent %d audio chunks to Gemini (queue=%d)", chunks_sent, self._audio_queue.qsize())
             except asyncio.TimeoutError:
                 continue
             except Exception as exc:
                 log.error("Gemini send error: %s", exc)
                 break
+        log.info("📤 Send loop ended — total chunks sent: %d", chunks_sent)
 
     async def _recv_loop(self):
         while self._running:
@@ -227,17 +232,20 @@ class GeminiSession:
             log.warning("Gemini sent non-JSON: %s", str(raw)[:200])
             return
 
+        # Log EVERY message from Gemini (truncate large audio payloads)
+        msg_preview = json.dumps(msg)[:500]
+        log.info("📥 Gemini msg: %s", msg_preview)
+
         # ── 1. Tool call (top-level field) ──────────────────────────────────
-        #    Gemini Live sends {"toolCall": {"functionCalls": [...]}} at the
-        #    top level — NOT nested inside serverContent.modelTurn.parts.
         tool_call = msg.get("toolCall")
         if tool_call:
+            log.info("🔧 TOOL CALL received: %s", json.dumps(tool_call)[:500])
             for fc in tool_call.get("functionCalls", []):
                 if fc.get("name") == "flag_scam_alert":
                     args = fc.get("args", {})
                     fc_id = fc.get("id", "")
                     log.warning(
-                        "SCAM DETECTED: category=%s confidence=%s reason=%s  (id=%s)",
+                        "🚨 SCAM DETECTED: category=%s confidence=%s reason=%s  (id=%s)",
                         args.get("category"), args.get("confidence"),
                         args.get("reason"), fc_id,
                     )
@@ -259,13 +267,26 @@ class GeminiSession:
             model_turn = server_content.get("modelTurn", {})
             parts = model_turn.get("parts", [])
 
-            # Alternate format: function calls INSIDE modelTurn parts
+            # Log part types
+            for i, part in enumerate(parts):
+                part_keys = list(part.keys())
+                if "inlineData" in part:
+                    data_info = part["inlineData"]
+                    log.info("  Part[%d] = audio (%s, %d bytes b64)", i, data_info.get("mimeType", "?"), len(data_info.get("data", "")))
+                elif "text" in part:
+                    log.info("  Part[%d] = text: %s", i, part["text"][:200])
+                elif "functionCall" in part:
+                    log.info("  Part[%d] = functionCall: %s", i, json.dumps(part["functionCall"])[:300])
+                else:
+                    log.info("  Part[%d] = %s", i, part_keys)
+
+            # Function calls INSIDE modelTurn parts
             for part in parts:
                 fc = part.get("functionCall")
                 if fc and fc.get("name") == "flag_scam_alert":
                     args = fc.get("args", {})
                     fc_id = fc.get("id", "")
-                    log.warning("SCAM DETECTED (in modelTurn): %s", args)
+                    log.warning("🚨 SCAM DETECTED (in modelTurn): %s", args)
                     await broadcast_alert({
                         "type":       "scam_alert",
                         "category":   args.get("category", "other"),
@@ -276,16 +297,16 @@ class GeminiSession:
 
             text_parts = [p.get("text", "") for p in parts if "text" in p]
             if text_parts:
-                log.info("Gemini text: %s", " ".join(text_parts))
+                log.info("💬 Gemini text response: %s", " ".join(text_parts))
 
             if server_content.get("turnComplete"):
-                log.debug("Gemini turn complete.")
+                log.info("✅ Gemini turn complete.")
 
         if "setupComplete" in msg:
             log.info("Gemini setupComplete (late).")
 
         if not tool_call and not server_content and "setupComplete" not in msg:
-            log.debug("Gemini unclassified msg: %s", json.dumps(msg)[:300])
+            log.info("❓ Gemini unclassified msg keys: %s", list(msg.keys()))
 
     async def _send_tool_response(self, fc_id: str, fc_name: str, result: dict):
         """Send a tool response back to Gemini — required after function calls."""
