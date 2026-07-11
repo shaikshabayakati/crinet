@@ -43,7 +43,7 @@ GEMINI_WS_URL    = (
     "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
     f"?key={GEMINI_API_KEY}"
 )
-GEMINI_MODEL     = "models/gemini-live-2.5-flash-preview"
+GEMINI_MODEL     = "models/gemini-3.1-flash-live-preview"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -88,9 +88,7 @@ Do not wait for the call to end. Do not ask clarifying questions. Just call the 
 GEMINI_SETUP_MSG = {
     "setup": {
         "model": GEMINI_MODEL,
-        "generationConfig": {
-            "responseModalities": ["TEXT"],
-        },
+        "responseModalities": ["TEXT"],
         "systemInstruction": {
             "parts": [{"text": SYSTEM_PROMPT}]
         },
